@@ -2,31 +2,35 @@ import os
 import torch
 import torch.nn as nn
 import numpy as np
-from torch.optim import Adam
+from torch.optim import Adam, lr_scheduler
 from torch.utils.data import DataLoader
-from model import BERT, BERTClassification
-from .focal_loss import FocalLoss
+from model import BERT, BERTPrediction
 
 # from .metric import Average_Accuracy, Kappa_Coefficient
 from sklearn.metrics import (
-    confusion_matrix,
-    cohen_kappa_score,
-    classification_report,
-    f1_score,
+    mean_absolute_error,
+    r2_score
 )
 from tqdm.auto import tqdm
+
+def evaluate_predictions(y_true, y_pred):
+    mae = mean_absolute_error(y_true, y_pred)
+    r2 = r2_score(y_true, y_pred)
+    print(f"Mean Absolute Error: {mae}, R² Score: {r2}")
+    return mae, r2
 
 
 class BERTFineTuner:
     def __init__(
         self,
         bert: BERT,
-        num_classes: int,
+        num_features: int,
         train_loader: DataLoader,
         valid_loader: DataLoader,
-        criterion="CrossEntropyLoss",
         lr: float = 1e-3,
-        weight_decay=0,
+        warmup_epochs: int = 10,
+        decay_gamma: float = 0.99,
+        gradient_clipping_value=5.0,
         with_cuda: bool = True,
         cuda_devices=None,
     ):
@@ -44,18 +48,17 @@ class BERTFineTuner:
         print(f"Running on {self.device}...")
 
         self.bert = bert
-        self.model = BERTClassification(bert, num_classes)
-        self.num_classes = num_classes
+        self.model = BERTPrediction(bert, num_features).to(self.device)
+        self.num_classes = num_features
 
         self.train_loader = train_loader
         self.valid_loader = valid_loader
 
-        self.optim = Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
-
-        if criterion == "FocalLoss":
-            self.criterion = FocalLoss(gamma=1)
-        else:
-            self.criterion = nn.CrossEntropyLoss()
+        self.optim = Adam(self.model.parameters(), lr=lr)
+        self.warmup_epochs = warmup_epochs
+        self.optim_schedule = lr_scheduler.ExponentialLR(self.optim, gamma=decay_gamma)
+        self.gradient_clippling = gradient_clipping_value
+        self.criterion = nn.MSELoss(reduction="none")
 
         if with_cuda and torch.cuda.is_available():
             if torch.cuda.device_count() > 1:
@@ -76,136 +79,128 @@ class BERTFineTuner:
     def train(self, epoch):
         self.model.train()
 
+        data_iter = tqdm(
+            enumerate(self.train_loader),
+            desc="EP_%s:%d" % ("train", epoch),
+            total=len(self.train_loader),
+            bar_format="{l_bar}{r_bar}",
+        )
+
         train_loss = 0.0
-        counter = 0
-        for data in self.train_loader:
+        for i, data in data_iter:
             data = {key: value.to(self.device) for key, value in data.items()}
 
-            predict = self.model(
+            mask_prediction = self.model(
                 data["bert_input"].float(),
                 data["timestamp"].long(),
                 data["bert_mask"].long(),
             )
 
-            loss = self.criterion(predict, data["class_label"].squeeze().long())
-
-            if torch.isnan(loss):  # PROBLEM!
-                print(data["class_label"].squeeze().long())
-                print(predict)
-                print(data["timestamp"].long())
-                exit(1)
+            loss = self.criterion(mask_prediction, data["bert_target"].float())
+            mask = data["loss_mask"].unsqueeze(-1)
+            loss = (loss * mask.float()).sum() / mask.sum()
 
             self.optim.zero_grad()
             loss.backward()
+            nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clippling)
             self.optim.step()
+
             train_loss += loss.item()
+            post_fix = {
+                "epoch": epoch,
+                "iter": i,
+                "avg_loss": train_loss / (i + 1),
+                "loss": loss.item(),
+            }
 
-            counter += 1
+            if i % 10 == 0:
+                data_iter.write(str(post_fix))
 
-        train_loss /= counter
+        train_loss = train_loss / len(data_iter)
+        # self.writer.add_scalar('train_loss', train_loss, global_step=epoch)
 
-        valid_loss, valid_OA, valid_kappa, valid_F1score = self.validate()
+        valid_loss = self.validate()
+        # self.writer.add_scalar('validation_loss', valid_loss, global_step=epoch)
+
+        if epoch >= self.warmup_epochs:
+            self.optim_schedule.step()
+        # self.writer.add_scalar('cosine_lr_decay', self.optim_schedule.get_lr()[0], global_step=epoch)
+
         print(
-            "EP%d, Valid Accuracy: OA=%.2f%%, medium_F1_score=%.2f%%"
-            % (epoch, valid_OA, valid_F1score)
+            "EP%d, train_loss=%.5f, validate_loss=%.5f"
+            % (epoch, train_loss, valid_loss)
         )
-
-        return train_loss, valid_loss, valid_OA, valid_kappa, valid_F1score
+        return train_loss, valid_loss
 
     def validate(self):
         self.model.eval()
 
         valid_loss = 0.0
         counter = 0
-        total_correct = 0
-        total_element = 0
-        y_pred = []
-        y_true = []
+        
         for data in self.valid_loader:
             data = {key: value.to(self.device) for key, value in data.items()}
 
             with torch.no_grad():
-                y_p = self.model(
+                mask_prediction = self.model(
                     data["bert_input"].float(),
                     data["timestamp"].long(),
                     data["bert_mask"].long(),
                 )
 
-                y = data["class_label"].view(-1)
-                loss = self.criterion(y_p, y.long())
+                loss = self.criterion(mask_prediction, data["bert_target"].float())
+
+            mask = data["loss_mask"].unsqueeze(-1)
+            loss = (loss * mask.float()).sum() / mask.sum()
 
             valid_loss += loss.item()
-
-            y_true.extend(list(map(int, y.cpu())))
-            y_p = y_p.argmax(dim=-1)
-            y_pred.extend(list(map(int, y_p.cpu())))
-
-            # compute OA
-            correct = (y == y_p).sum()
-            total_correct += correct
-            total_element += y.numel()
-
             counter += 1
 
         valid_loss /= counter
-        valid_OA = total_correct * 100.0 / total_element
-        valid_kappa = cohen_kappa_score(
-            y_true, y_pred, labels=list(range(self.num_classes))
-        )
-        valid_F1score = (
-            f1_score(
-                y_true, y_pred, average="macro", labels=list(range(self.num_classes))
-            )
-            * 100.0
-        )
 
-        return valid_loss, valid_OA, valid_kappa, valid_F1score
+        return valid_loss
 
     def test(self, data_loader):
         self.model.eval()
 
-        total_correct = 0
-        total_element = 0
-        y_pred = []
-        y_true = []
+        valid_loss = 0.0
+        counter = 0
+        y_true_list = []
+        y_pred_list = []
+        
         for data in tqdm(data_loader, miniters=1, unit="test"):
             data = {key: value.to(self.device) for key, value in data.items()}
 
             with torch.no_grad():
-                y_p = self.model(
+                mask_prediction = self.model(
                     data["bert_input"].float(),
                     data["timestamp"].long(),
                     data["bert_mask"].long(),
                 )
 
-                y = data["class_label"].view(-1)
+                loss = self.criterion(mask_prediction, data["bert_target"].float())
 
-            y_true.extend(list(map(int, y.cpu())))
-            y_p = y_p.argmax(dim=-1)
-            y_pred.extend(list(map(int, y_p.cpu())))
+            mask = data["loss_mask"].unsqueeze(-1)
+            loss = (loss * mask.float()).sum() / mask.sum()
 
-            # compute OA
-            correct = (y == y_p).sum()
-            total_correct += correct
-            total_element += y.numel()
+            valid_loss += loss.item()
+            counter += 1
+            
+            # Coletar valores reais e preditos para avaliação
+            y_true_list += data["bert_target"].cpu().numpy().tolist()
+            y_pred_list += mask_prediction.cpu().numpy().tolist()
 
-        test_OA = total_correct * 100.0 / total_element
-        test_kappa = cohen_kappa_score(y_true, y_pred)
-        test_F1score = (
-            f1_score(
-                y_true, y_pred, average="macro", labels=list(range(self.num_classes))
-            )
-            * 100.0
-        )
-        test_conf = (
-            confusion_matrix(y_true, y_pred, labels=list(range(self.num_classes)))
-            * 100.0
-        )
-        test_report = classification_report(
-            y_true, y_pred, labels=list(range(self.num_classes))
-        )
+        valid_loss /= counter
 
-        return test_OA, test_kappa, test_F1score, test_conf, test_report
+        # Avaliar as predições após o loop
+        y_true = np.array(y_true_list)
+        y_pred = np.array(y_pred_list)
+        
+        mae, r2 = evaluate_predictions(y_true, y_pred)
+
+        print(f"Validation Loss: {valid_loss:.4f}, MAE: {mae:.4f}, R² Score: {r2:.4f}")
+        return valid_loss
+
 
     def save(self, epoch, path):
         if not os.path.exists(path):
@@ -239,9 +234,11 @@ class BERTFineTuner:
         except IOError:
             print("Error: parameter file does not exist!")
 
+    # Work on predict
     def predict(self, data_loader):
         self.model.eval()
-        y_preds = []
+        y_true_list = []
+        y_pred_list = []
 
         with torch.inference_mode():
             for data in tqdm(data_loader, desc="Predicting..."):
@@ -253,8 +250,14 @@ class BERTFineTuner:
                     data["bert_mask"].long(),
                 )
 
-                y_preds += result.argmax(dim=-1).numpy(force=True).tolist()
+                # Coletar predições e valores reais
+                y_pred_list += result.cpu().numpy().tolist()
+                y_true_list += data["bert_target"].cpu().numpy().tolist()
 
-        self.model.train()
+        # Avaliar as predições
+        y_true = np.array(y_true_list)
+        y_pred = np.array(y_pred_list)
+        
+        mae, r2 = evaluate_predictions(y_true, y_pred)
 
-        return np.array(y_preds, dtype=np.int16)
+        return np.array(y_pred), mae, r2

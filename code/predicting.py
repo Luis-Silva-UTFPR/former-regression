@@ -178,6 +178,7 @@ if __name__ == "__main__":
         else:
             print("Cannot find the pre-trained parameter file, please check the path!")
 
+    # Work from here, don't have classification metrics anymore
     trainer = BERTFineTuner(
         bert,
         config.num_classes,

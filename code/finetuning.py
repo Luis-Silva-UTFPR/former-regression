@@ -212,6 +212,7 @@ if __name__ == "__main__":
         else:
             print("Cannot find the pre-trained parameter file, please check the path!")
 
+    # Work from here, don't have oa, kappa, f1 anymore
     print("Creating downstream task trainer...")
     trainer = BERTFineTuner(
         bert,

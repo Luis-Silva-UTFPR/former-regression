@@ -8,13 +8,11 @@ import random
 import os
 import argparse
 import geopandas as gpd
-from sklearn.metrics import classification_report, confusion_matrix
-
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 
 def setup_seed(seed):
     np.random.seed(seed)
     random.seed(seed)
-
 
 def Config():
     parser = argparse.ArgumentParser()
@@ -78,28 +76,10 @@ def Config():
         help="The dimensionality of satellite observations.",
     )
     parser.add_argument(
-        "--num_classes",
-        default=15,
-        type=int,
-        help="Number of classes.",
-    )
-    parser.add_argument(
         "--hidden_size",
         default=256,
         type=int,
         help="Number of hidden neurons of the Transformer network.",
-    )
-    parser.add_argument(
-        "--layers",
-        default=3,
-        type=int,
-        help="Number of layers of the Transformer network.",
-    )
-    parser.add_argument(
-        "--attn_heads",
-        default=8,
-        type=int,
-        help="Number of attention heads of the Transformer network.",
     )
     parser.add_argument(
         "--learning_rate",
@@ -133,7 +113,6 @@ def Config():
     )
     return parser.parse_args()
 
-
 if __name__ == "__main__":
     setup_seed(0)
     config = Config()
@@ -160,7 +139,7 @@ if __name__ == "__main__":
         drop_last=False,
     )
 
-    print("Initialing SITS-Former...")
+    print("Initializing SITS-Former...")
     bert = BERT(
         num_features=config.num_features,
         hidden=config.hidden_size,
@@ -178,10 +157,8 @@ if __name__ == "__main__":
         else:
             print("Cannot find the pre-trained parameter file, please check the path!")
 
-    # Work from here, don't have classification metrics anymore
     trainer = BERTFineTuner(
         bert,
-        config.num_classes,
         train_loader=None,
         valid_loader=None,
         lr=config.learning_rate,
@@ -192,22 +169,14 @@ if __name__ == "__main__":
 
     print("Testing SITS-Former...")
     trainer.load(config.finetune_path)
-    y_pred = trainer.predict(pred_data_loader)
+    y_pred, mae, r2 = trainer.predict(pred_data_loader)
 
     df = gpd.read_parquet(pred_path)
     df["y_pred"] = y_pred
-    df["crop_number"] = pred_dataset.class_labels
+    # df["crop_number"] = pred_dataset.class_labels  # Assumindo que essa coluna ainda existe
 
-    print(
-        classification_report(
-            df["crop_number"], df["y_pred"], labels=list(range(config.num_classes))
-        )
-    )
-
-    print(
-        confusion_matrix(
-            df["crop_number"], df["y_pred"], labels=list(range(config.num_classes))
-        )
-    )
+    # Exibir métricas de desempenho
+    print(f"Mean Absolute Error: {mae}")
+    print(f"R² Score: {r2}")
 
     df.to_parquet("../data/output.parquet")

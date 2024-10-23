@@ -11,11 +11,8 @@ from tqdm.auto import tqdm
 
 
 def setup_seed(seed):
-    # torch.manual_seed(seed)
-    # torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     random.seed(seed)
-    # torch.backends.cudnn.deterministic = True
 
 
 def Config():
@@ -194,7 +191,7 @@ if __name__ == "__main__":
         drop_last=False,
     )
 
-    print("Initialing SITS-Former...")
+    print("Initializing BERT model for fine-tuning...")
     bert = BERT(
         num_features=config.num_features,
         hidden=config.hidden_size,
@@ -212,8 +209,8 @@ if __name__ == "__main__":
         else:
             print("Cannot find the pre-trained parameter file, please check the path!")
 
-    # Work from here, don't have oa, kappa, f1 anymore
-    print("Creating downstream task trainer...")
+    # Create trainer for fine-tuning
+    print("Creating fine-tuning task trainer...")
     trainer = BERTFineTuner(
         bert,
         config.num_classes,
@@ -225,34 +222,27 @@ if __name__ == "__main__":
         cuda_devices=config.cuda_devices,
     )
 
-    print("Training/Fine-tuning SITS-Former...")
-    Best_OA = 0
-    Best_Kappa = 0
-    Best_F1 = 0
-    for epoch in tqdm(
-        range(config.epochs), miniters=1, unit="epoch"
-    ):  # Skip first iteration to not count Pytorch compile
-        _, _, valid_oa, valid_kappa, valid_F1score = trainer.train(epoch)
-        if valid_F1score >= Best_F1:
-            Best_OA = valid_oa
-            Best_Kappa = valid_kappa
-            Best_F1 = valid_F1score
+    print("Training/Fine-tuning the model...")
+    Best_MAE = float("inf")
+    Best_R2 = -float("inf")
+    
+    for epoch in tqdm(range(config.epochs), miniters=1, unit="epoch"):
+        train_loss, valid_loss = trainer.train(epoch)
+        valid_mae, valid_r2 = trainer.test(valid_data_loader)
+        
+        if valid_mae < Best_MAE:
+            Best_MAE = valid_mae
+            Best_R2 = valid_r2
             trainer.save(epoch, config.finetune_path)
+    
     print(
-        "Best performance on the validation set: OA = %.2f%%, Kappa = %.4f, medium_F1score = %.2f%%"
-        % (Best_OA, Best_Kappa, Best_F1)
+        "Best performance on the validation set: MAE = %.4f, R² = %.4f"
+        % (Best_MAE, Best_R2)
     )
 
     print("\n")
-    print("Testing SITS-Former...")
+    print("Testing the model...")
     trainer.load(config.finetune_path)
-    test_OA, test_kappa, test_F1score, confusion_matrix, test_report = trainer.test(
-        test_data_loader
-    )
-    print(
-        "Best performance on the test set: OA = %.2f%%, Kappa = %.4f, medium_F1score = %.2f%%"
-        % (test_OA, test_kappa, test_F1score)
-    )
-    # pkl.dump(confusion_matrix, open(os.path.join(config.finetune_path, 'conf_mat.pkl'), 'wb'))
-    print(test_report)
-    print((confusion_matrix / 100).astype(np.int16))
+    test_loss = trainer.test(test_data_loader)
+
+    print(f"Test results: MAE = {test_loss:.4f}")

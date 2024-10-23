@@ -5,7 +5,6 @@ import random
 import os
 from dataset.data_augmentation import transform
 
-
 class PretrainDataset(Dataset):
     def __init__(
         self, file_path, num_features, patch_size, max_length, norm=None, mask_rate=0.15
@@ -73,6 +72,10 @@ class PretrainDataset(Dataset):
                 constant_values=0,
             )
 
+            # Valores de produtividade para o ano correspondente
+            productivity = sample["productivity"]  # Exemplo: [1] ou [n], dependendo da estrutura dos dados
+            productivity = np.expand_dims(productivity, axis=0)  # Adiciona dimensão se necessário
+
             # prediction target: the center pixel (the pixel to be classified afterward)
             bert_target = np.squeeze(ts_origin[:, :, 2, 2])  # [max_Length, band_nums]
 
@@ -89,6 +92,7 @@ class PretrainDataset(Dataset):
             "bert_mask": bert_mask,
             "loss_mask": mask,
             "timestamp": doy,
+            # "productivity": productivity,  # Adicionando produtividade ao output
         }
 
         return {key: torch.from_numpy(value) for key, value in output.items()}

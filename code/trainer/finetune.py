@@ -5,20 +5,15 @@ import numpy as np
 from torch.optim import Adam, lr_scheduler
 from torch.utils.data import DataLoader
 from model import BERT, BERTPrediction
-
-# from .metric import Average_Accuracy, Kappa_Coefficient
-from sklearn.metrics import (
-    mean_absolute_error,
-    r2_score
-)
+from sklearn.metrics import mean_absolute_error, r2_score
 from tqdm.auto import tqdm
 
 def evaluate_predictions(y_true, y_pred):
+    """Avalia as predições utilizando MAE e R²"""
     mae = mean_absolute_error(y_true, y_pred)
     r2 = r2_score(y_true, y_pred)
     print(f"Mean Absolute Error: {mae}, R² Score: {r2}")
     return mae, r2
-
 
 class BERTFineTuner:
     def __init__(
@@ -49,7 +44,6 @@ class BERTFineTuner:
 
         self.bert = bert
         self.model = BERTPrediction(bert, num_features).to(self.device)
-        self.num_classes = num_features
 
         self.train_loader = train_loader
         self.valid_loader = valid_loader
@@ -62,26 +56,22 @@ class BERTFineTuner:
 
         if with_cuda and torch.cuda.is_available():
             if torch.cuda.device_count() > 1:
-                print(
-                    "Using %d GPUs for model pre-training" % torch.cuda.device_count()
-                )
+                print(f"Using {torch.cuda.device_count()} GPUs for model pre-training")
                 self.model = nn.DataParallel(self.model, device_ids=cuda_devices)
             torch.backends.cudnn.benchmark = True
 
         self.model = self.model.to(self.device)
         self.criterion = self.criterion.to(self.device)
 
-        number_parameters = (
-            sum([p.nelement() for p in self.model.parameters()]) / 1000000
-        )
-        print("Total Parameters: %.2f M" % number_parameters)
+        number_parameters = sum(p.numel() for p in self.model.parameters()) / 1e6
+        print(f"Total Parameters: {number_parameters:.2f} M")
 
     def train(self, epoch):
         self.model.train()
 
         data_iter = tqdm(
             enumerate(self.train_loader),
-            desc="EP_%s:%d" % ("train", epoch),
+            desc=f"EP_{epoch}:train",
             total=len(self.train_loader),
             bar_format="{l_bar}{r_bar}",
         )
@@ -116,25 +106,16 @@ class BERTFineTuner:
             if i % 10 == 0:
                 data_iter.write(str(post_fix))
 
-        train_loss = train_loss / len(data_iter)
-        # self.writer.add_scalar('train_loss', train_loss, global_step=epoch)
-
+        train_loss /= len(data_iter)
         valid_loss = self.validate()
-        # self.writer.add_scalar('validation_loss', valid_loss, global_step=epoch)
-
         if epoch >= self.warmup_epochs:
             self.optim_schedule.step()
-        # self.writer.add_scalar('cosine_lr_decay', self.optim_schedule.get_lr()[0], global_step=epoch)
 
-        print(
-            "EP%d, train_loss=%.5f, validate_loss=%.5f"
-            % (epoch, train_loss, valid_loss)
-        )
+        print(f"EP{epoch}, train_loss={train_loss:.5f}, validate_loss={valid_loss:.5f}")
         return train_loss, valid_loss
 
     def validate(self):
         self.model.eval()
-
         valid_loss = 0.0
         counter = 0
         
@@ -149,22 +130,18 @@ class BERTFineTuner:
                 )
 
                 loss = self.criterion(mask_prediction, data["bert_target"].float())
-
-            mask = data["loss_mask"].unsqueeze(-1)
-            loss = (loss * mask.float()).sum() / mask.sum()
+                mask = data["loss_mask"].unsqueeze(-1)
+                loss = (loss * mask.float()).sum() / mask.sum()
 
             valid_loss += loss.item()
             counter += 1
 
         valid_loss /= counter
-
         return valid_loss
 
     def test(self, data_loader):
         self.model.eval()
-
         valid_loss = 0.0
-        counter = 0
         y_true_list = []
         y_pred_list = []
         
@@ -179,28 +156,21 @@ class BERTFineTuner:
                 )
 
                 loss = self.criterion(mask_prediction, data["bert_target"].float())
-
-            mask = data["loss_mask"].unsqueeze(-1)
-            loss = (loss * mask.float()).sum() / mask.sum()
+                mask = data["loss_mask"].unsqueeze(-1)
+                loss = (loss * mask.float()).sum() / mask.sum()
 
             valid_loss += loss.item()
-            counter += 1
-            
-            # Coletar valores reais e preditos para avaliação
             y_true_list += data["bert_target"].cpu().numpy().tolist()
             y_pred_list += mask_prediction.cpu().numpy().tolist()
 
-        valid_loss /= counter
+        valid_loss /= len(data_loader)
 
-        # Avaliar as predições após o loop
+        # Avaliar predições após o loop
         y_true = np.array(y_true_list)
         y_pred = np.array(y_pred_list)
         
         mae, r2 = evaluate_predictions(y_true, y_pred)
-
-        print(f"Validation Loss: {valid_loss:.4f}, MAE: {mae:.4f}, R² Score: {r2:.4f}")
-        return valid_loss
-
+        return valid_loss, mae, r2
 
     def save(self, epoch, path):
         if not os.path.exists(path):
@@ -216,25 +186,22 @@ class BERTFineTuner:
             output_path,
         )
 
-        print("EP:%d Model Saved on:" % epoch, output_path)
+        print(f"EP:{epoch} Model Saved on:", output_path)
         return output_path
 
     def load(self, path):
         input_path = os.path.join(path, "checkpoint.tar")
-
         try:
             checkpoint = torch.load(input_path)
             self.model.load_state_dict(checkpoint["model_state_dict"])
             self.optim.load_state_dict(checkpoint["optimizer_state_dict"])
             epoch = checkpoint["epoch"]
             self.model.train()
-
-            print("EP:%d Model loaded from:" % epoch, input_path)
+            print(f"EP:{epoch} Model loaded from:", input_path)
             return input_path
         except IOError:
             print("Error: parameter file does not exist!")
 
-    # Work on predict
     def predict(self, data_loader):
         self.model.eval()
         y_true_list = []
@@ -250,14 +217,11 @@ class BERTFineTuner:
                     data["bert_mask"].long(),
                 )
 
-                # Coletar predições e valores reais
                 y_pred_list += result.cpu().numpy().tolist()
                 y_true_list += data["bert_target"].cpu().numpy().tolist()
 
-        # Avaliar as predições
         y_true = np.array(y_true_list)
         y_pred = np.array(y_pred_list)
         
         mae, r2 = evaluate_predictions(y_true, y_pred)
-
         return np.array(y_pred), mae, r2

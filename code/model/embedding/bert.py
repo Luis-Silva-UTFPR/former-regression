@@ -3,86 +3,84 @@ from .position import PositionalEncoding
 
 
 class BERTEmbedding(nn.Module):
-    """
-    BERT Embedding which is consisted with under features
-        1. InputEmbedding : project the input to embedding
-        size through a lightweight 3D-CNN
-        2. PositionalEncoding : adding positional information
-        using sin/cos functions
-
-        sum of both features are output of BERTEmbedding
-    """
-
-    def __init__(self, num_features, dropout=0.1):
-        """
-        :param num_features: number of input features
-        :param dropout: dropout rate
-        """
+    def __init__(self, dropout=0.1):
         super().__init__()
-        channel_size = (32, 64, 256)
-        kernel_size = (5, 3, 5, 3)
+        channel_size = (32, 64)
 
+        # Primeira convolução
         self.conv1 = nn.Sequential(
             nn.Conv3d(
-                in_channels=1,
+                in_channels=10,              # Bandas espectrais
                 out_channels=channel_size[0],
-                kernel_size=(
-                    kernel_size[0],
-                    kernel_size[1],
-                    kernel_size[1]
-                )
+                kernel_size=(3, 3, 3),       # Temporal, Altura, Largura
+                stride=(1, 1, 1),            # Mantém dimensões
+                padding=(1, 1, 1)            # Preserva tamanhos
             ),
             nn.ReLU(),
             nn.BatchNorm3d(channel_size[0]),
         )
 
+        # Primeiro pooling
+        self.pool1 = nn.MaxPool3d(kernel_size=(2, 2, 2), stride=(2, 2, 2))
+
+        # Segunda convolução
         self.conv2 = nn.Sequential(
             nn.Conv3d(
                 in_channels=channel_size[0],
                 out_channels=channel_size[1],
-                kernel_size=(
-                    kernel_size[2],
-                    kernel_size[3],
-                    kernel_size[3]
-                )
+                kernel_size=(3, 2, 2),       # Temporal, Altura, Largura
+                stride=(1, 1, 1),            # Mantém dimensões temporais
+                padding=(1, 1, 1)            # Preserva tamanhos
             ),
             nn.ReLU(),
             nn.BatchNorm3d(channel_size[1]),
         )
 
+        # Segundo pooling
+        self.pool2 = nn.MaxPool3d(kernel_size=(1, 2, 2), stride=(1, 2, 2))
+
+        # Camada linear final
         self.linear = nn.Linear(
-            in_features=channel_size[1]*2,
-            out_features=channel_size[2]
+            in_features=channel_size[1],  # Final após convoluções
+            out_features=256             # Tamanho do embedding final
         )
 
-        self.embed_size = channel_size[-1]
-        self.position = PositionalEncoding(
-            d_model=self.embed_size,
-            max_len=366
-        )
         self.dropout = nn.Dropout(p=dropout)
 
-    def forward(self, input_sequence, doy_sequence):
-        batch_size = input_sequence.size(0)
-        seq_length = input_sequence.size(1)
-        band_num = input_sequence.size(2)
-        patch_size = input_sequence.size(3)
-        first_dim = batch_size*seq_length
+        # Positional Encoding
+        self.position = PositionalEncoding(
+            d_model=256,                   # Tamanho do embedding
+            max_len=75                      # Seq_length = 75
+        )
 
-        obs_embed = input_sequence.view(
-            first_dim,
-            band_num,
-            patch_size,
-            patch_size
-        ).unsqueeze(1)
-        obs_embed = self.conv1(obs_embed)
-        obs_embed = self.conv2(obs_embed)
-        obs_embed = self.linear(obs_embed.view(first_dim, -1))
-        # [batch_size*seq_length, embed_size]
-        obs_embed = obs_embed.view(batch_size, seq_length, -1)
+    def forward(self, input_sequence):
+        batch_size, years, seq_length, bands, w, h = input_sequence.shape
 
-        position_embed = self.position(doy_sequence)
-        x = obs_embed + position_embed
-        # [batch_size, seq_length, embed_size]
+        # Agrupa anos e observações temporais em uma única dimensão para convolução
+        x = input_sequence.view(batch_size, years * seq_length, bands, w, h).permute(0, 2, 1, 3, 4)
+
+        # Passa pela primeira convolução e pooling
+        x = self.conv1(x)
+        x = self.pool1(x)
+
+        # Passa pela segunda convolução e pooling
+        x = self.conv2(x)
+        x = self.pool2(x)
+
+        # Verifique a forma de x após a convolução e pooling
+        print(f"Shape após convolução e pooling: {x.shape}")
+
+        # Pega as dimensões: [batch_size, channels, seq_len, height, width]
+        _, c, t, w, h = x.shape
+
+        # Ajusta a forma para [batch_size, seq_len, embed_size]
+        x = x.view(batch_size, t, -1)  # Agrupa as características espaciais em um vetor por cada ponto no tempo
+
+        # Passa pela camada linear
+        x = self.linear(x)
+
+        # Adiciona o Positional Encoding
+        position_embed = self.position(x)
+        x = x + position_embed
 
         return self.dropout(x)

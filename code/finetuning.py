@@ -27,7 +27,7 @@ def Config():
     )
     parser.add_argument(
         "--pretrain_path",
-        default=None,
+        default="../checkpoints/pretrain",
         type=str,
         required=False,
         help="The storage path of the pre-trained model parameters.",
@@ -204,7 +204,7 @@ if __name__ == "__main__":
         bert_path = os.path.join(config.pretrain_path, "checkpoint.bert.tar")
         if os.path.exists(bert_path):
             bert.load_state_dict(
-                torch.load(bert_path, map_location=torch.device("cpu"))
+                torch.load(bert_path, map_location=torch.device("cpu")), strict=False
             )
         else:
             print("Cannot find the pre-trained parameter file, please check the path!")
@@ -213,11 +213,10 @@ if __name__ == "__main__":
     print("Creating fine-tuning task trainer...")
     trainer = BERTFineTuner(
         bert,
-        config.num_classes,
+        num_features=config.num_features,
         train_loader=train_data_loader,
         valid_loader=valid_data_loader,
         lr=config.learning_rate,
-        weight_decay=config.weight_decay,
         with_cuda=config.with_cuda,
         cuda_devices=config.cuda_devices,
     )

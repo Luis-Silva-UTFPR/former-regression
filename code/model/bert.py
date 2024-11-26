@@ -1,61 +1,51 @@
 import torch.nn as nn
-from torch.nn.modules.transformer import (
-    TransformerEncoder,
-    TransformerEncoderLayer
-)
-from torch.nn.modules import LayerNorm
-
 from .embedding import BERTEmbedding
 
 
 class BERT(nn.Module):
-
-    def __init__(
-        self,
-        num_features,
-        hidden,
-        n_layers,
-        attn_heads,
-        dropout=0.1
-    ):
-        """
-        :param num_features: number of input features
-        :param hidden: hidden size of the SITS-Former model
-        :param n_layers: numbers of Transformer blocks (layers)
-        :param attn_heads: number of attention heads
-        :param dropout: dropout rate
-        """
-
+    def __init__(self, dropout=0.1):
         super().__init__()
-        self.hidden = hidden
-        self.n_layers = n_layers
-        self.attn_heads = attn_heads
+        self.embedding = BERTEmbedding(dropout=dropout)
 
-        feed_forward_hidden = hidden * 4
-
-        self.embedding = BERTEmbedding(num_features)
-
-        encoder_layer = TransformerEncoderLayer(
-            hidden,
-            attn_heads,
-            feed_forward_hidden,
-            dropout
+        # Transformer para processar a sequência de embeddings ao longo dos anos
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=256,           # Tamanho do embedding
+            nhead=8,               # Número de cabeças de atenção
+            dim_feedforward=1024,  # Tamanho do feedforward
+            dropout=dropout
         )
-        encoder_norm = LayerNorm(hidden)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=6)
 
-        self.transformer_encoder = TransformerEncoder(
-            encoder_layer,
-            n_layers,
-            encoder_norm
-        )
+        # Camada final de regressão
+        self.output_layer = nn.Linear(256, 1)
 
-    def forward(self, x, doy, mask):
-        mask = mask == 0
+    def forward(self, x):
+        # Passa pelo embedding
+        x = self.embedding(x)
 
-        x = self.embedding(input_sequence=x, doy_sequence=doy)
+        # Passa pelo Transformer
+        x = x.permute(1, 0, 2)  # [batch_size, years, embed_size] -> [years, batch_size, embed_size]
+        x = self.transformer(x)
 
-        x = x.transpose(0, 1)
-        x = self.transformer_encoder(x, src_key_padding_mask=mask)
-        x = x.transpose(0, 1)
+        # Pega a média ao longo da dimensão dos anos
+        x = x.mean(dim=0)
 
-        return x
+        # Passa pela camada de regressão
+        output = self.output_layer(x)
+        return output
+
+
+# d_model = 256  # Tamanho do embedding
+# seq_length = 75  # Número de passos no tempo
+# batch_size = 16  # Tamanho do batch
+
+# # Supondo que 'time' seja uma matriz com os índices das posições temporais para o batch
+# time = torch.randint(0, seq_length, (batch_size, seq_length))  # Exemplo de índices de tempo aleatórios
+
+# # Garantir que time seja do tipo long (int64)
+# print(time.dtype)  # Verificar tipo, deve ser torch.int64 após .long()
+
+# positional_encoding = PositionalEncoding(d_model, max_len=366)
+# output = positional_encoding(time)
+
+# print(output.shape)  # [batch_size, seq_length, d_model]

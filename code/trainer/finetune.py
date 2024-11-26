@@ -15,6 +15,19 @@ def evaluate_predictions(y_true, y_pred):
     print(f"Mean Absolute Error: {mae}, R² Score: {r2}")
     return mae, r2
 
+
+def move_to_device(data, device):
+    """
+    Move os tensores de um dicionário (possivelmente aninhado) para o dispositivo especificado.
+    """
+    if isinstance(data, dict):
+        return {key: move_to_device(value, device) for key, value in data.items()}
+    elif isinstance(data, torch.Tensor):
+        return data.to(device)
+    else:
+        return data
+
+
 class BERTFineTuner:
     def __init__(
         self,
@@ -78,7 +91,12 @@ class BERTFineTuner:
 
         train_loss = 0.0
         for i, data in data_iter:
-            data = {key: value.to(self.device) for key, value in data.items()}
+            print({key: value.shape for key, value in data.items()})
+            # print(f"Data: {data}")
+            data = move_to_device(data, self.device)
+            # print(f"bert_input: {data['bert_input']}")
+            # print(f"bert_mask: {data['bert_mask']}")
+            # print(f"bert_target: {data['bert_target']}")
 
             mask_prediction = self.model(
                 data["bert_input"].float(),
@@ -120,7 +138,7 @@ class BERTFineTuner:
         counter = 0
         
         for data in self.valid_loader:
-            data = {key: value.to(self.device) for key, value in data.items()}
+            data = move_to_device(data, self.device)
 
             with torch.no_grad():
                 mask_prediction = self.model(
@@ -146,7 +164,7 @@ class BERTFineTuner:
         y_pred_list = []
         
         for data in tqdm(data_loader, miniters=1, unit="test"):
-            data = {key: value.to(self.device) for key, value in data.items()}
+            data = move_to_device(data, self.device)
 
             with torch.no_grad():
                 mask_prediction = self.model(
@@ -209,7 +227,7 @@ class BERTFineTuner:
 
         with torch.inference_mode():
             for data in tqdm(data_loader, desc="Predicting..."):
-                data = {key: value.to(self.device) for key, value in data.items()}
+                data = move_to_device(data, self.device)
 
                 result = self.model(
                     data["bert_input"].float(),

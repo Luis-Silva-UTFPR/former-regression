@@ -2,43 +2,52 @@ import os
 import torch
 import torch.nn as nn
 import numpy as np
-from torch.optim import Adam, lr_scheduler
 from torch.utils.data import DataLoader
-from model import BERT, BERTPrediction
-from sklearn.metrics import mean_absolute_error, r2_score
+from model import BERT, BERTRegression
 from tqdm.auto import tqdm
+from torch_optimizer import AdaBelief, Lamb
+from torch.optim import AdamW, Adam, SGD, Adamax, RMSprop, Adagrad, Adadelta, ASGD, LBFGS, NAdam, Rprop
 
-def evaluate_predictions(y_true, y_pred):
-    """Avalia as predições utilizando MAE e R²"""
-    mae = mean_absolute_error(y_true, y_pred)
-    r2 = r2_score(y_true, y_pred)
-    print(f"Mean Absolute Error: {mae}, R² Score: {r2}")
-    return mae, r2
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import matplotlib.pyplot as plt
 
 
-def move_to_device(data, device):
-    """
-    Move os tensores de um dicionário (possivelmente aninhado) para o dispositivo especificado.
-    """
-    if isinstance(data, dict):
-        return {key: move_to_device(value, device) for key, value in data.items()}
-    elif isinstance(data, torch.Tensor):
-        return data.to(device)
-    else:
-        return data
+class QuantileLoss(nn.Module):
+    def __init__(self, quantile):
+        super().__init__()
+        self.quantile = quantile
+
+    def forward(self, y_pred, y_true):
+        errors = y_true - y_pred
+        loss = torch.max((self.quantile - 1) * errors, self.quantile * errors)
+        return torch.mean(loss)
+
+
+class RMSELoss(nn.Module):
+    def __init__(self):
+        super(RMSELoss, self).__init__()
+        self.mse = nn.MSELoss()
+
+    def forward(self, y_pred, y_true):
+        loss = torch.sqrt(self.mse(y_pred, y_true))
+        return loss
+    
+
+class MAPELoss(nn.Module):
+    def forward(self, y_pred, y_true):
+        return torch.mean(torch.abs((y_true - y_pred) / (y_true + 1e-8)))
 
 
 class BERTFineTuner:
     def __init__(
         self,
         bert: BERT,
-        num_features: int,
+        num_classes: int,
         train_loader: DataLoader,
         valid_loader: DataLoader,
-        lr: float = 1e-3,
-        warmup_epochs: int = 10,
-        decay_gamma: float = 0.99,
-        gradient_clipping_value=5.0,
+        criterion="MAELoss",
+        lr: float = 5e-5,
+        weight_decay=0,
         with_cuda: bool = True,
         cuda_devices=None,
     ):
@@ -54,18 +63,21 @@ class BERTFineTuner:
         )
 
         print(f"Running on {self.device}...")
-
         self.bert = bert
-        self.model = BERTPrediction(bert, num_features).to(self.device)
 
-        self.train_loader = train_loader
-        self.valid_loader = valid_loader
+        # # Funciona bem 0.34 0.08 0.08
+        for param in self.bert.parameters():
+            param.requires_grad = True
+        # for param in self.bert.embedding.parameters():
+        #     param.requires_grad = False
 
-        self.optim = Adam(self.model.parameters(), lr=lr)
-        self.warmup_epochs = warmup_epochs
-        self.optim_schedule = lr_scheduler.ExponentialLR(self.optim, gamma=decay_gamma)
-        self.gradient_clippling = gradient_clipping_value
-        self.criterion = nn.MSELoss(reduction="none")
+        self.model = BERTRegression(bert).to(self.device)
+
+        params = list(self.model.parameters()) + list(self.bert.parameters())
+        self.num_classes = num_classes
+
+        self.lr = lr
+        self.best_loss = float("inf")
 
         if with_cuda and torch.cuda.is_available():
             if torch.cuda.device_count() > 1:
@@ -73,122 +85,209 @@ class BERTFineTuner:
                 self.model = nn.DataParallel(self.model, device_ids=cuda_devices)
             torch.backends.cudnn.benchmark = True
 
+        self.train_loader = train_loader
+        self.valid_loader = valid_loader
+
+        self.weight_decay = weight_decay
+        betas = (0.9, 0.999)  # Usado em otimizadores que exigem beta1 e beta2
+
+
+        # self.optim = Adam(params, lr=lr, betas=betas, weight_decay=weight_decay) # -0.0 0.07 0.04
+        # self.optim = AdamW(params, lr=lr, betas=betas, weight_decay=weight_decay) # -0.06 0.06 0.02
+        # self.optim = SGD(params, lr=lr, weight_decay=weight_decay) # xxxx
+        # self.optim = RMSprop(params, lr=lr, weight_decay=weight_decay) # xxxx
+        # self.optim = Adamax(params, lr=lr, betas=betas, weight_decay=weight_decay) # -0.06 0.04 0.02
+        # self.optim = ASGD(params, lr=lr, weight_decay=weight_decay) # xxxx
+        # self.optim = NAdam(params, lr=lr, betas=betas, weight_decay=weight_decay) # -0.04 0.05 0.01
+        # self.optim = Rprop(params, lr=lr) # overfitting 0.24 0.09 -0.12
+        self.optim = AdaBelief(params, lr=lr, betas=betas, weight_decay=weight_decay) # 0.14 0.10 0.07
+        # self.optim = Lamb(params, lr=lr, betas=betas, weight_decay=weight_decay) # -0.38 -0.00 -0.00
+
+        self.train_maes = []
+        self.valid_maes = []
+        self.train_mses = []
+        self.valid_mses = []
+        self.train_r2s = []
+        self.valid_r2s = []
+
+
+        if criterion == "MSELoss": # 0.40 0.20 0.05
+            self.criterion = nn.MSELoss()
+        elif criterion == "MAELoss": # 0.38 0.14 0.12
+            self.criterion = nn.L1Loss()
+        elif criterion == "RMSELoss": # 0.40 0.19 0.0
+            self.criterion = RMSELoss()
+        elif criterion == "HuberLoss": # 0.39 0.14 0.08
+            self.criterion = nn.HuberLoss(delta=1.0)
+        elif criterion == "SmoothL1Loss": # 0.42 0.20 0.09
+            self.criterion = nn.SmoothL1Loss(beta=1.0)
+        elif criterion == "QuantileLoss": # 0.37 0.12 0.02
+            self.criterion = QuantileLoss(quantile=0.5)
+        else:
+            raise ValueError(f"Unsupported criterion: {criterion}")
+
+
+        if with_cuda and torch.cuda.is_available():
+            if torch.cuda.device_count() > 1:
+                print(
+                    "Using %d GPUs for model pre-training" % torch.cuda.device_count()
+                )
+                self.model = nn.DataParallel(self.model, device_ids=cuda_devices)
+            torch.backends.cudnn.benchmark = True
+
         self.model = self.model.to(self.device)
         self.criterion = self.criterion.to(self.device)
 
-        number_parameters = sum(p.numel() for p in self.model.parameters()) / 1e6
-        print(f"Total Parameters: {number_parameters:.2f} M")
+        number_parameters = (
+            sum([p.nelement() for p in self.model.parameters()]) / 1000000
+        )
+        print("Total Parameters: %.2f M" % number_parameters)
 
     def train(self, epoch):
         self.model.train()
-
-        data_iter = tqdm(
-            enumerate(self.train_loader),
-            desc=f"EP_{epoch}:train",
-            total=len(self.train_loader),
-            bar_format="{l_bar}{r_bar}",
-        )
-
         train_loss = 0.0
-        for i, data in data_iter:
-            print({key: value.shape for key, value in data.items()})
-            # print(f"Data: {data}")
-            data = move_to_device(data, self.device)
-            # print(f"bert_input: {data['bert_input']}")
-            # print(f"bert_mask: {data['bert_mask']}")
-            # print(f"bert_target: {data['bert_target']}")
+        counter = 0
 
-            mask_prediction = self.model(
+        all_preds = []
+        all_labels = []
+
+        for data in self.train_loader:
+            data = {key: value.to(self.device) for key, value in data.items()}
+
+            predict = self.model(
                 data["bert_input"].float(),
                 data["timestamp"].long(),
-                data["bert_mask"].long(),
+                data["bert_mask"].long()
+                # data["area_ha"].squeeze().float(),
+                # data["ndvi"],
+                # data["ndwi"],
             )
+            target = data["class_label"].squeeze(-1).float()
+            loss = self.criterion(predict, target)
 
-            loss = self.criterion(mask_prediction, data["bert_target"].float())
-            mask = data["loss_mask"].unsqueeze(-1)
-            loss = (loss * mask.float()).sum() / mask.sum()
+            if torch.isnan(loss):  # PROBLEM!
+                print("Detected NaN in loss!")
+                print(f"Labels: {data['class_label'].squeeze().cpu()}")
+                print(f"Predictions: {predict.cpu()}")
+                exit(1)
 
             self.optim.zero_grad()
             loss.backward()
-            nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clippling)
             self.optim.step()
-
             train_loss += loss.item()
-            post_fix = {
-                "epoch": epoch,
-                "iter": i,
-                "avg_loss": train_loss / (i + 1),
-                "loss": loss.item(),
-            }
 
-            if i % 10 == 0:
-                data_iter.write(str(post_fix))
+            preds = predict.detach().cpu().numpy()
+            labels = data["class_label"].detach().cpu().numpy()
 
-        train_loss /= len(data_iter)
-        valid_loss = self.validate()
-        if epoch >= self.warmup_epochs:
-            self.optim_schedule.step()
+            all_preds.append(preds)
+            all_labels.append(labels)
 
-        print(f"EP{epoch}, train_loss={train_loss:.5f}, validate_loss={valid_loss:.5f}")
-        return train_loss, valid_loss
+            counter += 1
+        
+        all_preds = np.concatenate(all_preds)
+        all_labels = np.concatenate(all_labels)
+
+        train_r2 = r2_score(all_labels, all_preds)
+        train_mae = mean_absolute_error(all_labels, all_preds)
+        train_mse = mean_squared_error(all_labels, all_preds)
+
+        self.train_r2s.append(train_r2)
+        self.train_maes.append(train_mae)
+        self.train_mses.append(train_mse)
+
+        train_loss /= counter
+        valid_loss, metrics, y_p, y = self.validate()
+
+        self.valid_maes.append(metrics["MAE"])
+        self.valid_mses.append(metrics["MSE"])
+        self.valid_r2s.append(metrics["R2"])
+
+
+        print(
+            "EP%d, Train Loss: %.4f, Train R2: %.4f, Valid Loss: %.4f, Valid MAE: %.4f, Valid MSE: %.4f, Valid R2: %.4f"
+            % (epoch, train_loss, train_r2, valid_loss, metrics["MAE"], metrics["MSE"], metrics["R2"])
+        )
+        return train_loss, valid_loss, metrics, y_p, y, train_r2, train_mae
 
     def validate(self):
         self.model.eval()
+
         valid_loss = 0.0
         counter = 0
-        
+        y_pred = []
+        y_true = []
+
         for data in self.valid_loader:
-            data = move_to_device(data, self.device)
+            data = {key: value.to(self.device) for key, value in data.items()}
 
             with torch.no_grad():
-                mask_prediction = self.model(
+                y_p = self.model(
                     data["bert_input"].float(),
                     data["timestamp"].long(),
-                    data["bert_mask"].long(),
+                    data["bert_mask"].long()
+                    # data["area_ha"].squeeze().float(),
+                    # data["ndvi"],
+                    # data["ndwi"],
                 )
 
-                loss = self.criterion(mask_prediction, data["bert_target"].float())
-                mask = data["loss_mask"].unsqueeze(-1)
-                loss = (loss * mask.float()).sum() / mask.sum()
+                y = data["class_label"].view(-1).float()
+                loss = self.criterion(y_p, y)
 
             valid_loss += loss.item()
+
+            y_true.extend(y.cpu().tolist())
+            y_pred.extend(y_p.cpu().tolist())
+
             counter += 1
 
         valid_loss /= counter
-        return valid_loss
+        mae = mean_absolute_error(y_true, y_pred)
+        mse = mean_squared_error(y_true, y_pred)
+        r2 = r2_score(y_true, y_pred)
+
+        composite_metric = mae - r2
+
+        return valid_loss, {"MAE": mae, "MSE": mse, "R2": r2, "COMPOSITE": composite_metric}, y_p, y
 
     def test(self, data_loader):
         self.model.eval()
-        valid_loss = 0.0
-        y_true_list = []
-        y_pred_list = []
-        
-        for data in tqdm(data_loader, miniters=1, unit="test"):
-            data = move_to_device(data, self.device)
+
+        y_pred = []
+        y_true = []
+        area_ha = []
+
+        for data in tqdm(data_loader, desc="Testing..."):
+            data = {key: value.to(self.device) for key, value in data.items()}
 
             with torch.no_grad():
-                mask_prediction = self.model(
+                y_p = self.model(
                     data["bert_input"].float(),
                     data["timestamp"].long(),
-                    data["bert_mask"].long(),
+                    data["bert_mask"].long()
+                    # data["area_ha"].squeeze().float(),
+                    # data["ndvi"],
+                    # data["ndwi"],
                 )
 
-                loss = self.criterion(mask_prediction, data["bert_target"].float())
-                mask = data["loss_mask"].unsqueeze(-1)
-                loss = (loss * mask.float()).sum() / mask.sum()
+                y = data["class_label"].view(-1).float()
 
-            valid_loss += loss.item()
-            y_true_list += data["bert_target"].cpu().numpy().tolist()
-            y_pred_list += mask_prediction.cpu().numpy().tolist()
+            y_true.extend(y.cpu().tolist())
+            y_pred.extend(y_p.cpu().tolist())
+            # area_ha.extend(data["area_ha"].cpu().tolist())
 
-        valid_loss /= len(data_loader)
+        # y_true = np.array(y_true)
+        # y_pred = np.array(y_pred)
+        # area_ha = np.array(area_ha) 
 
-        # Avaliar predições após o loop
-        y_true = np.array(y_true_list)
-        y_pred = np.array(y_pred_list)
-        
-        mae, r2 = evaluate_predictions(y_true, y_pred)
-        return valid_loss, mae, r2
+        mae = mean_absolute_error(y_true, y_pred)
+        mse = mean_squared_error(y_true, y_pred)
+        r2 = r2_score(y_true, y_pred)
+
+        return {
+            "MAE": mae,
+            "MSE": mse,
+            "R2": r2
+        }, y_true, y_pred
 
     def save(self, epoch, path):
         if not os.path.exists(path):
@@ -204,42 +303,125 @@ class BERTFineTuner:
             output_path,
         )
 
-        print(f"EP:{epoch} Model Saved on:", output_path)
+        print("EP:%d Model Saved on:" % epoch, output_path)
         return output_path
 
     def load(self, path):
         input_path = os.path.join(path, "checkpoint.tar")
+
         try:
             checkpoint = torch.load(input_path)
             self.model.load_state_dict(checkpoint["model_state_dict"])
             self.optim.load_state_dict(checkpoint["optimizer_state_dict"])
             epoch = checkpoint["epoch"]
             self.model.train()
-            print(f"EP:{epoch} Model loaded from:", input_path)
+
+            print("EP:%d Model loaded from:" % epoch, input_path)
             return input_path
         except IOError:
             print("Error: parameter file does not exist!")
 
     def predict(self, data_loader):
+        # Coloca o modelo em modo de avaliação
         self.model.eval()
-        y_true_list = []
-        y_pred_list = []
+        y_preds = []
 
-        with torch.inference_mode():
+        self.model.to(self.device)
+
+
+        with torch.inference_mode():  # Certifique-se de usar o modo de inferência
             for data in tqdm(data_loader, desc="Predicting..."):
-                data = move_to_device(data, self.device)
+                # Move os dados para o mesmo dispositivo do modelo
+                data = {key: value.to(self.device) for key, value in data.items()}
+                
+                # Garantia de que o modelo também está no dispositivo correto
+                self.model.to(self.device)
 
+                # Passa os dados pelo modelo
                 result = self.model(
                     data["bert_input"].float(),
                     data["timestamp"].long(),
-                    data["bert_mask"].long(),
+                    data["bert_mask"].long()
+                    # data["area_ha"].squeeze().float(),
+                    # data["ndvi"],
+                    # data["ndwi"],
                 )
+                
+                # Move o resultado para CPU antes de adicionar à lista
+                y_preds.extend(result.cpu().tolist())
 
-                y_pred_list += result.cpu().numpy().tolist()
-                y_true_list += data["bert_target"].cpu().numpy().tolist()
+        # Retorna o modelo ao modo de treinamento
+        self.model.train()
+        return np.array(y_preds)
 
-        y_true = np.array(y_true_list)
-        y_pred = np.array(y_pred_list)
-        
-        mae, r2 = evaluate_predictions(y_true, y_pred)
-        return np.array(y_pred), mae, r2
+    
+    def plot_metrics(self, output_dir="SGD"):
+        os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(os.path.join(output_dir, "MAE"), exist_ok=True)
+        abs_path = os.path.join(output_dir, "MAE")
+
+        # Plot MAE
+        plt.figure(figsize=(10, 6))
+        plt.plot(self.valid_maes[0:], label="Valid MAE")
+        plt.xlabel("Epochs")
+        plt.ylabel("Mean Absolute Error")
+        plt.title("Valid MAE")
+        plt.legend()
+        plt.grid()
+        plt.savefig(f"{abs_path}/valid_mae.png")
+        plt.close()
+
+        # Plot MSE
+        plt.figure(figsize=(10, 6))
+        plt.plot(self.valid_mses[0:], label="Valid mse")
+        plt.xlabel("Epochs")
+        plt.ylabel("Mean Squared Error")
+        plt.title("Valid mse")
+        plt.legend()
+        plt.grid()
+        plt.savefig(f"{abs_path}/valid_mse.png")
+        plt.close()
+
+        # Plot R2
+        plt.figure(figsize=(10, 6))
+        plt.plot(self.valid_r2s[0:], label="Valid R²")
+        plt.xlabel("Epochs")
+        plt.ylabel("R²")
+        plt.title("Valid R²")
+        plt.legend()
+        plt.grid()
+        plt.savefig(f"{abs_path}/valid_r2.png")
+        plt.close()
+
+        # Plot MAE
+        plt.figure(figsize=(10, 6))
+        plt.plot(self.train_maes[0:], label="Train MAE")
+        plt.xlabel("Epochs")
+        plt.ylabel("Mean Absolute Error")
+        plt.title("Train MAE")
+        plt.legend()
+        plt.grid()
+        plt.savefig(f"{abs_path}/train_mae.png")
+        plt.close()
+
+        # Plot MSE
+        plt.figure(figsize=(10, 6))
+        plt.plot(self.train_mses[0:], label="Train mse")
+        plt.xlabel("Epochs")
+        plt.ylabel("Mean Squared Error")
+        plt.title("Train mse")
+        plt.legend()
+        plt.grid()
+        plt.savefig(f"{abs_path}/train_mse.png")
+        plt.close()
+
+        # Plot R2
+        plt.figure(figsize=(10, 6))
+        plt.plot(self.train_r2s[0:], label="Train R²")
+        plt.xlabel("Epochs")
+        plt.ylabel("R²")
+        plt.title("Train R²")
+        plt.legend()
+        plt.grid()
+        plt.savefig(f"{abs_path}/train_r2.png")
+        plt.close()

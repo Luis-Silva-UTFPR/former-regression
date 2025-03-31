@@ -5,8 +5,19 @@ import random
 import os
 from dataset.data_augmentation import transform
 
+
 class PretrainDataset(Dataset):
-    def __init__(self, file_path, num_features, patch_size, max_length, norm=None, mask_rate=0.15):
+    def __init__(
+        self, file_path, num_features, patch_size, max_length, norm=None, mask_rate=0.15
+    ):
+        """
+        :param file_path: path to the folder of the pre-training dataset
+        :param num_features: dimension of each pixel
+        :param patch_size: patch size
+        :param max_length: padded sequence length
+        :param norm: mean and std used to normalize the input reflectance
+        :param mask_rate: rate of masked timesteps
+        """
         self.file_path = file_path
         self.max_length = max_length
         self.dimension = num_features
@@ -17,7 +28,7 @@ class PretrainDataset(Dataset):
         self.mask_rate = mask_rate
 
         self.FileList = os.listdir(file_path)
-        self.TS_num = len(self.FileList)  # número de amostras não rotuladas
+        self.TS_num = len(self.FileList)  # number of unlabeled samples
         self.norm = norm
 
     def __len__(self):
@@ -42,10 +53,10 @@ class PretrainDataset(Dataset):
 
             ts_origin = transform(ts_origin)
 
-            # length of the time series (varia para cada amostra)
+            # length of the time series (varies for each sample)
             ts_length = ts_origin.shape[0]
 
-            # preenchimento da série temporal
+            # padding time series to the same length
             ts_origin = np.pad(
                 ts_origin,
                 ((0, self.max_length - ts_length), (0, 0), (0, 0), (0, 0)),
@@ -62,14 +73,13 @@ class PretrainDataset(Dataset):
                 constant_values=0,
             )
 
-
             # prediction target: the center pixel (the pixel to be classified afterward)
             bert_target = np.squeeze(ts_origin[:, :, 2, 2])  # [max_Length, band_nums]
 
-            # random masking
+            # randomly replace some patches with a pre-defined MASK_TOKEN
             ts_masking, mask = self.random_masking(ts_origin, ts_length)
 
-            # máscara de observações válidas
+            # mask of valid observations
             bert_mask = np.zeros((self.max_length,), dtype=int)
             bert_mask[:ts_length] = 1
 

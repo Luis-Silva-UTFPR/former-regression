@@ -8,11 +8,13 @@ import random
 import os
 import argparse
 import geopandas as gpd
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
 
 def setup_seed(seed):
     np.random.seed(seed)
     random.seed(seed)
+
 
 def Config():
     parser = argparse.ArgumentParser()
@@ -76,10 +78,28 @@ def Config():
         help="The dimensionality of satellite observations.",
     )
     parser.add_argument(
+        "--num_classes",
+        default=15,
+        type=int,
+        help="Number of classes.",
+    )
+    parser.add_argument(
         "--hidden_size",
         default=256,
         type=int,
         help="Number of hidden neurons of the Transformer network.",
+    )
+    parser.add_argument(
+        "--layers",
+        default=3,
+        type=int,
+        help="Number of layers of the Transformer network.",
+    )
+    parser.add_argument(
+        "--attn_heads",
+        default=8,
+        type=int,
+        help="Number of attention heads of the Transformer network.",
     )
     parser.add_argument(
         "--learning_rate",
@@ -113,6 +133,7 @@ def Config():
     )
     return parser.parse_args()
 
+
 if __name__ == "__main__":
     setup_seed(0)
     config = Config()
@@ -139,7 +160,7 @@ if __name__ == "__main__":
         drop_last=False,
     )
 
-    print("Initializing SITS-Former...")
+    print("Initialing SITS-Former...")
     bert = BERT(
         num_features=config.num_features,
         hidden=config.hidden_size,
@@ -159,6 +180,7 @@ if __name__ == "__main__":
 
     trainer = BERTFineTuner(
         bert,
+        num_classes=15,
         train_loader=None,
         valid_loader=None,
         lr=config.learning_rate,
@@ -169,14 +191,25 @@ if __name__ == "__main__":
 
     print("Testing SITS-Former...")
     trainer.load(config.finetune_path)
-    y_pred, mae, r2 = trainer.predict(pred_data_loader)
 
+    # Prever os valores de saída usando o dataset de previsão
+    y_pred = trainer.predict(pred_data_loader)
+
+    # Carregar os dados de entrada e adicionar as previsões
     df = gpd.read_parquet(pred_path)
     df["y_pred"] = y_pred
-    # df["crop_number"] = pred_dataset.class_labels  # Assumindo que essa coluna ainda existe
+    df["y_true"] = df["prod"] / ((df["area_ha"]*10000)/2500)
 
-    # Exibir métricas de desempenho
-    print(f"Mean Absolute Error: {mae}")
-    print(f"R² Score: {r2}")
+    y_true = df["y_true"]
+    mae = mean_absolute_error(y_true, y_pred)
+    mse = mean_squared_error(y_true, y_pred)
+    r2 = r2_score(y_true, y_pred)
 
-    df.to_parquet("../data/output.parquet")
+    print(f"MAE: {mae:.4f}")
+    print(f"MSE: {mse:.4f}")
+    print(f"R²: {r2:.4f}")
+
+    # Salvar as previsões (opcional)
+    df.to_parquet("predictions.parquet")
+    df.to_file("predictions.gpkg", driver="GPKG")
+    print(f"Previsões salvas em: {pred_path.replace('.parquet', '_predictions.parquet')}")

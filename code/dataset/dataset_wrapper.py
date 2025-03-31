@@ -37,6 +37,7 @@ class DataSetWrapper(object):
         return train_loader, valid_loader
 
     def get_train_validation_data_loaders(self, dataset):
+        # obtain training indices that will be used for validation
         num_train = len(dataset)
         indices = list(range(num_train))
         np.random.shuffle(indices)
@@ -44,7 +45,7 @@ class DataSetWrapper(object):
         split = int(np.floor(self.valid_size * num_train))
         train_idx, valid_idx = indices[split:], indices[:split]
 
-        # Define samplers for obtaining training and validation batches
+        # define samplers for obtaining training and validation batches
         train_sampler = SubsetRandomSampler(train_idx)
         valid_sampler = SubsetRandomSampler(valid_idx)
 
